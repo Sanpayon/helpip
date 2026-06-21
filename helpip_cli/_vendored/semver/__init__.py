@@ -1,0 +1,206 @@
+# BSD 3-Clause License
+#
+# Copyright (c) 2020 - 2024, ddelange, <ddelange@delange.dev>
+#
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice, this
+#    list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+#
+# 3. Neither the name of the copyright holder nor the names of its
+#    contributors may be used to endorse or promote products derived from
+#    this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+import re
+
+from helpip_cli._vendored.semver.empty_constraint import EmptyConstraint  # noqa:F401
+from helpip_cli._vendored.semver.patterns import (
+    BASIC_CONSTRAINT,
+    CARET_CONSTRAINT,
+    TILDE_CONSTRAINT,
+    TILDE_PEP440_CONSTRAINT,
+    X_CONSTRAINT,
+)
+from helpip_cli._vendored.semver.version import Version
+from helpip_cli._vendored.semver.version_constraint import VersionConstraint
+from helpip_cli._vendored.semver.version_range import VersionRange
+from helpip_cli._vendored.semver.version_union import VersionUnion
+
+__version__ = "0.1.1"
+
+
+def parse_constraint(constraints):  # type: (str) -> VersionConstraint
+    if constraints == "*":
+        return VersionRange()
+
+    or_constraints = re.split(r"\s*\|\|?\s*", constraints.strip())
+    or_groups = []
+    for constraints in or_constraints:
+        and_constraints = re.split(
+            "(?<!^)(?<![=>< ,]) *(?<!-)[, ](?!-) *(?!,|$)", constraints
+        )
+        constraint_objects = []
+
+        if len(and_constraints) > 1:
+            for constraint in and_constraints:
+                constraint_objects.append(parse_single_constraint(constraint))
+        else:
+            constraint_objects.append(parse_single_constraint(and_constraints[0]))
+
+        if len(constraint_objects) == 1:
+            constraint = constraint_objects[0]
+        else:
+            constraint = constraint_objects[0]
+            for next_constraint in constraint_objects[1:]:
+                constraint = constraint.intersect(next_constraint)
+
+        or_groups.append(constraint)
+
+    if len(or_groups) == 1:
+        return or_groups[0]
+    else:
+        return VersionUnion.of(*or_groups)
+
+
+def parse_single_constraint(constraint):  # type: (str) -> VersionConstraint
+    m = re.match(r"(?i)^v?[xX*](\.[xX*])*$", constraint)
+    if m:
+        return VersionRange()
+
+    # Tilde range
+    m = TILDE_CONSTRAINT.match(constraint)
+    if m:
+        version = Version.parse(m.group(1))
+
+        high = version.stable.next_minor
+        if len(m.group(1).split(".")) == 1:
+            high = version.stable.next_major
+
+        return VersionRange(
+            version, high, include_min=True, always_include_max_prerelease=True
+        )
+
+    # PEP 440 Tilde range (~=)
+    m = TILDE_PEP440_CONSTRAINT.match(constraint)
+    if m:
+        precision = 1
+        if m.group(3):
+            precision += 1
+
+            if m.group(4):
+                precision += 1
+
+        version = Version.parse(m.group(1))
+
+        if precision == 2:
+            low = version
+            high = version.stable.next_major
+        else:
+            low = version
+            high = version.stable.next_minor
+
+        return VersionRange(
+            low, high, include_min=True, always_include_max_prerelease=True
+        )
+
+    # Caret range
+    m = CARET_CONSTRAINT.match(constraint)
+    if m:
+        version = Version.parse(m.group(1))
+
+        return VersionRange(
+            version,
+            version.next_breaking,
+            include_min=True,
+            always_include_max_prerelease=True,
+        )
+
+    # X Range
+    m = X_CONSTRAINT.match(constraint)
+    if m:
+        op = m.group(1)
+        major = int(m.group(2))
+        minor = m.group(3)
+
+        if minor is not None:
+            version = Version(major, int(minor), 0)
+
+            result = VersionRange(
+                version,
+                version.next_minor,
+                include_min=True,
+                always_include_max_prerelease=True,
+            )
+        else:
+            if major == 0:
+                result = VersionRange(max=Version(1, 0, 0))
+            else:
+                version = Version(major, 0, 0)
+
+                result = VersionRange(
+                    version,
+                    version.next_major,
+                    include_min=True,
+                    always_include_max_prerelease=True,
+                )
+
+        if op == "!=":
+            result = VersionRange().difference(result)
+
+        return result
+
+    # Basic comparator
+    m = BASIC_CONSTRAINT.match(constraint)
+    if m:
+        op = m.group(1)
+        version = m.group(2)
+
+        if version == "dev":
+            version = "0.0-dev"
+
+        try:
+            version = Version.parse(version)
+        except ValueError:
+            raise ValueError(
+                "Could not parse version constraint: {}".format(constraint)
+            )
+
+        if op == "<":
+            return VersionRange(max=version)
+        elif op == "<=":
+            return VersionRange(max=version, include_max=True)
+        elif op == ">":
+            return VersionRange(min=version)
+        elif op == ">=":
+            return VersionRange(min=version, include_min=True)
+        elif op == "!=":
+            return VersionUnion(VersionRange(max=version), VersionRange(min=version))
+        else:
+            return version
+
+    # VCS support
+    try:
+        return Version.parse(constraint)
+    except ValueError:
+        raise ValueError("Could not parse version constraint: {}".format(constraint))
+
+    raise ValueError("Could not parse version constraint: {}".format(constraint))
