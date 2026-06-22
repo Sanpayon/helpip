@@ -9,6 +9,7 @@ dataset instead of fetching PyPI wheels. On conflict, the engine's
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any, Optional
 
 from helpip_cli._vendored.mixology.constraint import Constraint
@@ -28,18 +29,24 @@ from helpip_cli._vendored.semver import (
 )
 from helpip_cli import markers
 
+# For non-base packages without a version constraint, the solver only sees the
+# single newest version.  Exploring older releases is rarely useful — a user
+# who needs an old version should pin it explicitly — and the PubGrub search
+# space explodes combinatorially when dozens of unconstrained packages are in
+# the root set.  (Bump this to 3-5 if you need limited backtracking.)
+_UNCONSTRAINED_WINDOW = 1
+
 
 class InvalidDatasetError(ValueError):
     pass
 
 
 class Dependency:
-    """A dependency returned by ``dependencies_for`` and converted via
-    ``convert_dependency``. Mirrors pipgrip's Dependency but is pip-free."""
+    """A dependency returned by ``dependencies_for``."""
 
     def __init__(self, name: str, constraint_str: str, pip_string: str) -> None:
         self.name = name
-        self.constraint = parse_constraint(constraint_str or "*")
+        self.constraint = _cached_parse_constraint(constraint_str or "*")
         self.pretty_constraint = constraint_str or "*"
         self.pip_string = pip_string
         self.package = Package(pip_string)
@@ -56,18 +63,38 @@ def _specs_to_constraint(specs) -> str:
     return ",".join("{}{}".format(op, version) for op, version in specs)
 
 
+@lru_cache(maxsize=32768)
+def _cached_parse_constraint(constraint_str: str):
+    return parse_constraint(constraint_str)
+
+
+def _constraint_key(constraint) -> Optional[tuple]:
+    """Hashable key for ``_versions_for`` filter cache."""
+    if constraint is None:
+        return None
+    t = type(constraint).__name__
+    if t == "Range":
+        return ("Range", constraint.min, constraint.max,
+                constraint.include_min, constraint.include_max)
+    if t == "Union":
+        inner = tuple(
+            (r.min, r.max, r.include_min, r.include_max)
+            for r in sorted(constraint.ranges,
+                            key=lambda r: (str(r.min) if r.min else "", str(r.max) if r.max else ""))
+        )
+        return ("Union", inner)
+    if t == "EmptyRange":
+        return ("EmptyRange",)
+    return ("other",)
+
+
 class DependenciesPackageSource(BasePackageSource):
     """PackageSource backed by the indexed ``dependencies.json`` dataset.
 
-    Dataset shape::
-
-        {
-          "version": "...",
-          "requirement_index": ["torch>=2.0", "numpy>=1.20", ...],
-          "packages": {
-            "torch": {"versions": {"2.1.0": {"requires": [0, 1]}}}
-          }
-        }
+    *Version* objects are pre-parsed at init time (cheap, ~632K calls).
+    *Dependency* objects are built lazily on the solver's first visit to a
+    (package, version) pair and then cached — this avoids parsing 7.9M
+    requirement edges for packages the solver never reaches.
     """
 
     def __init__(self, dataset: dict, marker_env: Optional[dict] = None) -> None:
@@ -77,40 +104,50 @@ class DependenciesPackageSource(BasePackageSource):
         requirement_index = dataset.get("requirement_index")
         if not isinstance(packages, dict):
             raise InvalidDatasetError('dataset "packages" must be an object')
-        # requirement_index is optional: the published dataset stores the
-        # requirement strings directly in each version's "requires" list.
         if requirement_index is not None and not isinstance(requirement_index, list):
             raise InvalidDatasetError('dataset "requirement_index" must be an array')
         self._requirement_index: list[str] = list(requirement_index or [])
 
-        # canonical_name -> {version_str -> list[req_str]}
-        # Normalizes both the indexed form (requires: [int, ...]) and the
-        # direct-string form (requires: ["pkg>=1.0", ...]) to a list of
-        # requirement strings.
-        self._versions: dict[str, dict[str, list[str]]] = {}
+        # canonical_name -> sorted list[Version] (newest-first)
+        self._versions_list: dict[str, list[Version]] = {}
+        # canonical_name -> {version_str -> list[str]} (raw req strings, resolved)
+        self._requires_raw: dict[str, dict[str, list[str]]] = {}
+        # canonical names whose EVERY version has zero dependencies (leaf packages).
+        self._base_packages: set[str] = set()
+
         for name, record in packages.items():
             if not isinstance(record, dict):
                 continue
             versions = record.get("versions")
             if not isinstance(versions, dict):
                 continue
-            clean: dict[str, list[str]] = {}
+            canonical = parse_req(name).key
+            vers: dict[str, list[str]] = {}
+            version_objs: list[Version] = []
+            all_leaf = True
             for ver, ver_record in versions.items():
                 if not isinstance(ver_record, dict):
                     continue
                 requires = ver_record.get("requires")
-                # A missing/empty "requires" means the version has no
-                # dependencies (a leaf package) — keep it with an empty list
-                # rather than dropping it. Drop only malformed non-list values.
                 if requires is None:
                     resolved: list[str] = []
                 elif isinstance(requires, list):
                     resolved = self._resolve_requires(requires)
                 else:
                     continue
-                clean[ver] = resolved
-            if clean:
-                self._versions[parse_req(name).key] = clean
+                vers[ver] = resolved
+                version_objs.append(Version.parse(ver))
+                if resolved:
+                    all_leaf = False
+            if vers:
+                self._versions_list[canonical] = sorted(version_objs, reverse=True)
+                self._requires_raw[canonical] = vers
+                if all_leaf:
+                    self._base_packages.add(canonical)
+
+        # Lazy caches — populated on first solver access, live for one solve
+        self._deps_cache: dict[tuple, list[Dependency]] = {}
+        self._filter_cache: dict[tuple, list[Version]] = {}
 
         self._marker_env = marker_env
         self._root_dependencies: list[Dependency] = []
@@ -118,12 +155,9 @@ class DependenciesPackageSource(BasePackageSource):
         super().__init__()
 
     def _resolve_requires(self, requires: list) -> list[str]:
-        """Convert a version's ``requires`` list to requirement strings.
+        """Resolve a ``requires`` list to requirement strings.
 
-        Supports both published formats:
-        - direct strings: ``["numpy>=1.17", "packaging>=20.0"]``
-        - integer indices into ``requirement_index``: ``[0, 1]``
-        Mixed lists fall back to stringifying non-string entries via the index.
+        Supports int-indexed (via ``requirement_index``) and direct-string entries.
         """
         out: list[str] = []
         for entry in requires:
@@ -132,6 +166,25 @@ class DependenciesPackageSource(BasePackageSource):
             elif isinstance(entry, int) and 0 <= entry < len(self._requirement_index):
                 out.append(self._requirement_index[entry])
         return out
+
+    def _build_deps(self, pkg_name: str, ver_str: str) -> list[Dependency]:
+        """Build the cached ``Dependency`` list for one (package, version)."""
+        raw = self._requires_raw.get(pkg_name, {}).get(ver_str)
+        if not raw:
+            return []
+        deps: list[Dependency] = []
+        for req_str in raw:
+            if not markers.should_include(req_str, self._marker_env):
+                continue
+            try:
+                req = parse_req(req_str)
+            except Exception:
+                continue
+            if req.url:
+                continue
+            constraint = _specs_to_constraint(req.specs)
+            deps.append(Dependency(req.key, constraint, str(req)))
+        return deps
 
     # -- BasePackageSource contract -----------------------------------------
 
@@ -145,45 +198,57 @@ class DependenciesPackageSource(BasePackageSource):
         self._root_dependencies.append(Dependency(req.key, constraint, str(req)))
 
     def _versions_for(self, package, constraint=None) -> list:
-        versions_map = self._versions.get(package.name)
-        if not versions_map:
+        versions = self._versions_list.get(package.name)
+        if not versions:
             return []
+
+        # Unconstrained selection: trim candidate count to keep backtracking
+        # tractable.  Base (leaf) packages get exactly 1 — no reason to try
+        # older releases of a package that has no transitive dependencies.
+        # Non-base packages get a small window of the newest versions.
+        if constraint is None:
+            if package.name in self._base_packages:
+                return versions[:1]
+            if len(versions) > _UNCONSTRAINED_WINDOW:
+                return versions[:_UNCONSTRAINED_WINDOW]
+            return versions
+
+        ckey = _constraint_key(constraint)
+        if ckey is not None:
+            cache_key = (package.name, ckey)
+            cached = self._filter_cache.get(cache_key)
+            if cached is not None:
+                return cached
+
         out = []
-        for ver_str in versions_map.keys():
-            version = Version.parse(ver_str)
+        for version in versions:
             point = Range(version, version, True, True)
-            if constraint is None or constraint.allows_any(point):
+            if constraint.allows_any(point):
                 out.append(version)
-        return sorted(out, reverse=True)
+
+        # Also prune constrained-but-huge result sets (e.g. `package>=0.1` on
+        # a package with 2000 versions — the solver can't try them all anyway).
+        if len(out) > _UNCONSTRAINED_WINDOW:
+            out = out[:_UNCONSTRAINED_WINDOW]
+
+        if ckey is not None:
+            self._filter_cache[(package.name, ckey)] = out
+        return out
 
     def dependencies_for(self, package, version) -> list:
         if package == self.root:
             return self._root_dependencies
-        versions_map = self._versions.get(package.name)
-        if not versions_map:
-            return []
-        requires = versions_map.get(str(version))
-        if not requires:
-            return []
-        deps: list[Dependency] = []
-        for req_str in requires:
-            if not markers.should_include(req_str, self._marker_env):
-                continue
-            try:
-                req = parse_req(req_str)
-            except Exception:
-                continue
-            if req.url:
-                # Direct references are not supported in the dataset model.
-                continue
-            constraint = _specs_to_constraint(req.specs)
-            deps.append(Dependency(req.key, constraint, str(req)))
+        cache_key = (package.name, str(version))
+        cached = self._deps_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        deps = self._build_deps(package.name, str(version))
+        self._deps_cache[cache_key] = deps
         return deps
 
     def convert_dependency(self, dependency: Dependency):
         constraint = dependency.constraint
         if isinstance(constraint, EmptyConstraint):
-            # An impossible (self-contradictory) requirement: nothing can satisfy it.
             mix_constraint = EmptyRange()
         elif isinstance(constraint, VersionRange):
             mix_constraint = Range(
@@ -196,11 +261,7 @@ class DependenciesPackageSource(BasePackageSource):
         else:
             ranges = [
                 Range(
-                    _r.min,
-                    _r.max,
-                    _r.include_min,
-                    _r.include_max,
-                    str(_r),
+                    _r.min, _r.max, _r.include_min, _r.include_max, str(_r),
                 )
                 for _r in constraint.ranges
             ]
@@ -229,9 +290,17 @@ def resolve(ai_specs, dataset: dict, marker_env: Optional[dict] = None) -> Resol
 
     solver = VersionSolver(source, threads=1)
     try:
-        result = solver.solve()
+        # Cap iterations at 200 — enough for most real-world dependency
+        # graphs (2-5 AI packages with pinned versions).  A larger graph
+        # (12+ unconstrained packages) will hit this cap in ~13s and
+        # report the unsatisfied packages with actionable guidance.
+        result = solver.solve(max_steps=200)
     except SolverFailure as exc:
-        return ResolveResult(error=True, message=str(exc))
+        msg = str(exc)
+        # For step-limit failures, use the clear message we attached.
+        if hasattr(exc, '_incompatibility') and hasattr(exc._incompatibility, '_step_limit_msg'):
+            msg = exc._incompatibility._step_limit_msg
+        return ResolveResult(error=True, message=msg)
     except Exception as exc:  # noqa: BLE001
         return ResolveResult(error=True, message="Resolution failed: {}".format(exc))
 

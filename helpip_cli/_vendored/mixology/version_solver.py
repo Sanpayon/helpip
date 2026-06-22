@@ -83,10 +83,13 @@ class VersionSolver:
     def is_solved(self):  # type: () -> bool
         return not self._solution.unsatisfied
 
-    def solve(self):  # type: () -> SolverResult
+    def solve(self, max_steps=1000):  # type: () -> SolverResult
         """
         Finds a set of dependencies that match the root package's constraints,
         or raises an error if no such set is available.
+
+        ``max_steps`` caps the number of ``_run()`` iterations before giving up
+        with a clear message — prevents unbounded search on very large graphs.
         """
         start = time.time()
 
@@ -98,10 +101,20 @@ class VersionSolver:
         self._propagate(self._source.root)
 
         packages_tried = 0
-        max_tries = -1
         while True:
-            if packages_tried == max_tries:
-                raise SolverFailure("Stopping, {} packages tried.".format(max_tries))
+            if max_steps is not None and packages_tried >= max_steps:
+                # Build a simple Incompatibility so SolverFailure.__str__ works.
+                terms = [
+                    Term(Constraint(self._source.root, Range()), False)
+                ]
+                msg = (
+                    "Resolution exceeded {} steps ({} packages unsatisfied). "
+                    "Consider pinning explicit package versions to narrow the search."
+                ).format(max_steps, len(self._solution.unsatisfied))
+                failure = Incompatibility(terms, RootCause())
+                # Attach the message for error reporting.
+                failure._step_limit_msg = msg
+                raise SolverFailure(failure)
             if not self._run():
                 break
 

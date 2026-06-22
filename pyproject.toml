@@ -35,6 +35,8 @@ dependencies = [
 
 # Project URLs will be populated once the source is published.
 [project.urls]
+"Homepage" = "https://github.com/Sanpayon/helpip"
+"Data Source" = "https://github.com/Sanpayon/PyPI_AI_Essential_Dependencies"
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
